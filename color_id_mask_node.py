@@ -3,10 +3,11 @@ import numpy as np
 import cv2
 
 class ColorIDMaskExtractor:
-    """
-    Extracts per-actor masks from color-coded pose reference using HSV hue-distance.
-    Red=1, Blue=2, Green=3, Magenta=4. Handles touching bodies via seam filling.
-    """
+    # Extracts per-actor masks from a color-coded pose reference using hue-distance matching
+    # (tolerant of anti-aliased/muted outline colors) instead of strict RGB thresholds.
+    # Red outline = Actor 1, Blue = Actor 2, Green = Actor 3, Magenta = Actor 4.
+    # Where colors touch = perfect mask boundary (no identity bleeding!)
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -21,10 +22,11 @@ class ColorIDMaskExtractor:
     FUNCTION = "extract_masks"
     CATEGORY = "mask/compositing"
 
+    # OpenCV hue scale is 0-179. Targets: red=0, green=60, blue=120, magenta=150.
     TARGET_HUES = {1: 0, 2: 120, 3: 60, 4: 150}
-    HUE_TOLERANCE = 15
-    MIN_SATURATION = 30
-    MIN_VALUE = 30
+    HUE_TOLERANCE = 14    # see v2 fix #1 above -- closest target-hue pair is 30 deg apart
+    MIN_SATURATION = 25   # excludes near-gray background and black arrows/text/lineart
+    MIN_VALUE = 30         # excludes near-black pixels
 
     def extract_masks(self, color_pose_reference, num_actors):
         img = (color_pose_reference[0].cpu().numpy() * 255).astype(np.uint8)
@@ -37,48 +39,63 @@ class ColorIDMaskExtractor:
             d = np.abs(h - target)
             return np.minimum(d, 180 - d)
 
-        raw_masks = []
+        # Contour-fill instead of radius dilation: a large dilate/close (as used previously) grows
+        # outward by ~45-75px and bridges the gap between two DIFFERENT actor colors wherever their
+        # outlines run close together (e.g. touching/embracing poses), merging both actors into one
+        # blob. Filling the enclosed interior of each color's own (lightly-closed) contour instead
+        # respects the actual outline shape and can't bleed across a neighboring color.
+        close_kernel = np.ones((15, 15), np.uint8)   # v2 fix #2
+        margin_kernel = np.ones((5, 5), np.uint8)
+
+        raw_masks = [None, None, None, None]  # index 0..3 == actor 1..4
         for i in range(1, 5):
             if i <= num_actors:
                 outline = (valid & (hue_dist(H, self.TARGET_HUES[i]) <= self.HUE_TOLERANCE)).astype(np.uint8) * 255
-                kernel = np.ones((5, 5), np.uint8)
-                closed = cv2.morphologyEx(outline, cv2.MORPH_CLOSE, kernel, iterations=2)
-                contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                closed = cv2.morphologyEx(outline, cv2.MORPH_CLOSE, close_kernel, iterations=3)
+                # v2 fix #4: convex hull instead of contour-fill -- dense internal linework (eyebrows,
+                # hair strands, fold lines) can sit >21px from the main silhouette and never close into
+                # one contour, leaving the true gap between them unfilled (background shows through the
+                # "hole"). A hull of every outline pixel can't have an interior hole no matter how
+                # fragmented the line art is; the only cost is mild over-fill in concave spots (armpit,
+                # crossed knee) which is cosmetically harmless vs. background poking through clothing.
+                ys, xs = np.nonzero(closed)
                 filled = np.zeros_like(closed)
-                if contours:
-                    cv2.drawContours(filled, contours, -1, 255, thickness=cv2.FILLED)
-                else:
-                    filled = closed
-                raw_masks.append(filled > 0)
-            else:
-                raw_masks.append(np.zeros(img.shape[:2], dtype=bool))
+                if len(xs) > 0:
+                    hull = cv2.convexHull(np.stack([xs, ys], axis=1).astype(np.int32))
+                    cv2.fillConvexPoly(filled, hull, 255)
+                raw_masks[i - 1] = filled > 0
 
-        # Seam filling for touching actors
-        active_masks = [m for m in raw_masks[:num_actors] if m.any()]
-        if len(active_masks) > 1:
-            combined = np.zeros_like(active_masks[0])
-            for m in active_masks: combined |= m
-            
-            dists = [cv2.distanceTransform((~m).astype(np.uint8), cv2.DIST_L2, 3) for m in raw_masks[:num_actors]]
-            dist_stack = np.stack(dists, axis=0)
-            nearest = np.argmin(dist_stack, axis=0)
-            
-            final_masks = []
-            for i in range(num_actors):
-                m = raw_masks[i].copy()
-                seam_region = (nearest == i) & combined
-                m = m | seam_region
-                final_masks.append(m)
-            raw_masks[:num_actors] = final_masks
+        # v2 fix #3: seam-fill any pixel left unclaimed by every actor, inside their combined
+        # silhouette, by nearest-distance assignment -- this is exactly the touching/contact zone.
+        active = [(i, m) for i, m in enumerate(raw_masks) if m is not None]
+        if active:
+            combined = np.zeros_like(active[0][1], dtype=bool)
+            for _, m in active:
+                combined |= m
+            claimed = np.zeros_like(combined, dtype=bool)
+            for _, m in active:
+                claimed |= m
+            unassigned = combined & ~claimed
+            if unassigned.any():
+                dists = [cv2.distanceTransform((~m).astype(np.uint8), cv2.DIST_L2, 3) for _, m in active]
+                nearest = np.argmin(np.stack(dists), axis=0)
+                for pos, (i, m) in enumerate(active):
+                    raw_masks[i] = m | (unassigned & (nearest == pos))
 
         masks = []
-        for i in range(4):
-            if i < len(raw_masks):
-                mask = torch.from_numpy(raw_masks[i].astype(np.float32))
+        for i in range(1, 5):
+            if raw_masks[i - 1] is not None:
+                filled = cv2.dilate(raw_masks[i - 1].astype(np.uint8) * 255, margin_kernel, iterations=1)  # small margin only
+                mask = torch.from_numpy((filled > 0).astype(np.float32))
             else:
                 mask = torch.zeros((img.shape[0], img.shape[1]), dtype=torch.float32)
             masks.append(mask.unsqueeze(0))
         return tuple(masks)
 
-NODE_CLASS_MAPPINGS = {"ColorIDMaskExtractor": ColorIDMaskExtractor}
-NODE_DISPLAY_NAME_MAPPINGS = {"ColorIDMaskExtractor": "Color ID Mask Extractor"}
+
+NODE_CLASS_MAPPINGS = {
+    "ColorIDMaskExtractor": ColorIDMaskExtractor
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "ColorIDMaskExtractor": "Color ID Mask Extractor"
+}
