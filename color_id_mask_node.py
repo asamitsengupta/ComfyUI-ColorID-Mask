@@ -3,10 +3,10 @@ import numpy as np
 import cv2
 
 class ColorIDMaskExtractor:
-    # Extracts per-actor masks from a color-coded pose reference using hue-distance matching
-    # (tolerant of anti-aliased/muted outline colors) instead of strict RGB thresholds.
+    # Extracts per-actor masks from a color-coded pose reference using RGB colour-excess stroke detection
+    # (works for outlines on a plain background AND for outlines drawn over a photo).
     # Red outline = Actor 1, Blue = Actor 2, Green = Actor 3, Magenta = Actor 4.
-    # Where colors touch = perfect mask boundary (no identity bleeding!)
+    # Where colors touch, each pixel goes to the actor with the nearest outline (no identity bleeding).
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -22,65 +22,56 @@ class ColorIDMaskExtractor:
     FUNCTION = "extract_masks"
     CATEGORY = "mask/compositing"
 
-    # OpenCV hue scale is 0-179. Targets: red=0, green=60, blue=120, magenta=150.
-    TARGET_HUES = {1: 0, 2: 120, 3: 60, 4: 150}
-    HUE_TOLERANCE = 14    # see v2 fix #1 above -- closest target-hue pair is 30 deg apart
-    MIN_SATURATION = 25   # excludes near-gray background and black arrows/text/lineart
-    MIN_VALUE = 30         # excludes near-black pixels
+    # Stroke detection by RGB colour-EXCESS, not hue: outlines drawn over a PHOTO share hue with skin,
+    # wood, and red objects, so the old hue mask + convex hull swallowed ~75% of the frame (doctor included).
+    # Excess = how strongly the actor's colour dominates the other channels. Thresholds are per colour
+    # because thin anti-aliased strokes over a photo are muted (blue strokes measured ~RGB(30,73,117)).
+    # Red/blue are tuned on a real pose image; green/magenta are conservative defaults.
+    EXCESS_MIN = {1: 90, 2: 28, 3: 40, 4: 40}
+    MIN_BLOB = 30        # drop specks smaller than this (px)
+    CLUSTER_GAP = 31     # strokes of one actor lie within this dilation of each other; farther blobs are noise
+
+    @staticmethod
+    def _excess(img, i):
+        R, G, B = (img[..., c].astype(np.int16) for c in range(3))
+        if i == 1: return R - np.maximum(G, B)      # red
+        if i == 2: return B - np.maximum(R, G)      # blue
+        if i == 3: return G - np.maximum(R, B)      # green
+        return np.minimum(R, B) - G                 # magenta
 
     def extract_masks(self, color_pose_reference, num_actors):
         img = (color_pose_reference[0].cpu().numpy() * 255).astype(np.uint8)
-        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
-        H = hsv[:, :, 0].astype(np.int16)
-        S, V = hsv[:, :, 1], hsv[:, :, 2]
-        valid = (S > self.MIN_SATURATION) & (V > self.MIN_VALUE)
-
-        def hue_dist(h, target):
-            d = np.abs(h - target)
-            return np.minimum(d, 180 - d)
-
-        # Contour-fill instead of radius dilation: a large dilate/close (as used previously) grows
-        # outward by ~45-75px and bridges the gap between two DIFFERENT actor colors wherever their
-        # outlines run close together (e.g. touching/embracing poses), merging both actors into one
-        # blob. Filling the enclosed interior of each color's own (lightly-closed) contour instead
-        # respects the actual outline shape and can't bleed across a neighboring color.
-        close_kernel = np.ones((15, 15), np.uint8)   # v2 fix #2
+        close_kernel = np.ones((15, 15), np.uint8)
         margin_kernel = np.ones((5, 5), np.uint8)
 
-        raw_masks = [None, None, None, None]  # index 0..3 == actor 1..4
-        for i in range(1, 5):
-            if i <= num_actors:
-                outline = (valid & (hue_dist(H, self.TARGET_HUES[i]) <= self.HUE_TOLERANCE)).astype(np.uint8) * 255
-                closed = cv2.morphologyEx(outline, cv2.MORPH_CLOSE, close_kernel, iterations=3)
-                # v2 fix #4: convex hull instead of contour-fill -- dense internal linework (eyebrows,
-                # hair strands, fold lines) can sit >21px from the main silhouette and never close into
-                # one contour, leaving the true gap between them unfilled (background shows through the
-                # "hole"). A hull of every outline pixel can't have an interior hole no matter how
-                # fragmented the line art is; the only cost is mild over-fill in concave spots (armpit,
-                # crossed knee) which is cosmetically harmless vs. background poking through clothing.
-                ys, xs = np.nonzero(closed)
-                filled = np.zeros_like(closed)
-                if len(xs) > 0:
-                    hull = cv2.convexHull(np.stack([xs, ys], axis=1).astype(np.int32))
-                    cv2.fillConvexPoly(filled, hull, 255)
-                raw_masks[i - 1] = filled > 0
+        strokes, raw_masks = [None] * 4, [None] * 4   # index 0..3 == actor 1..4
+        for i in range(1, num_actors + 1):
+            m = (self._excess(img, i) > self.EXCESS_MIN[i]).astype(np.uint8)
+            n, lab, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+            keep = np.isin(lab, [k for k in range(1, n) if st[k, cv2.CC_STAT_AREA] >= self.MIN_BLOB])
+            if keep.any():   # keep only the main stroke cluster (drops stray same-colour objects in the photo)
+                d = cv2.dilate(keep.astype(np.uint8), np.ones((self.CLUSTER_GAP,) * 2, np.uint8))
+                n2, lab2, _, _ = cv2.connectedComponentsWithStats(d, connectivity=8)
+                cnt = np.bincount(lab2[keep], minlength=n2); cnt[0] = 0
+                keep &= lab2 == cnt.argmax()
+            strokes[i - 1] = keep
+            # convex hull of the (lightly closed) strokes: can't have interior holes however fragmented the line art is
+            closed = cv2.morphologyEx(keep.astype(np.uint8) * 255, cv2.MORPH_CLOSE, close_kernel, iterations=3,
+                                      borderType=cv2.BORDER_CONSTANT, borderValue=0)  # default border value smeared masks to the image edge
+            ys, xs = np.nonzero(closed)
+            filled = np.zeros_like(closed)
+            if len(xs) > 0:
+                cv2.fillConvexPoly(filled, cv2.convexHull(np.stack([xs, ys], axis=1).astype(np.int32)), 255)
+            raw_masks[i - 1] = filled > 0
 
-        # v2 fix #3: seam-fill any pixel left unclaimed by every actor, inside their combined
-        # silhouette, by nearest-distance assignment -- this is exactly the touching/contact zone.
-        active = [(i, m) for i, m in enumerate(raw_masks) if m is not None]
-        if active:
-            combined = np.zeros_like(active[0][1], dtype=bool)
-            for _, m in active:
-                combined |= m
-            claimed = np.zeros_like(combined, dtype=bool)
-            for _, m in active:
-                claimed |= m
-            unassigned = combined & ~claimed
-            if unassigned.any():
-                dists = [cv2.distanceTransform((~m).astype(np.uint8), cv2.DIST_L2, 3) for _, m in active]
-                nearest = np.argmin(np.stack(dists), axis=0)
-                for pos, (i, m) in enumerate(active):
-                    raw_masks[i] = m | (unassigned & (nearest == pos))
+        # Hulls of touching actors overlap: give each overlapping pixel to the actor whose OUTLINE is nearest.
+        active = [i for i in range(4) if raw_masks[i] is not None]
+        if len(active) > 1:
+            dist = np.stack([cv2.distanceTransform((~strokes[i]).astype(np.uint8), cv2.DIST_L2, 3) for i in active])
+            owner = np.argmin(dist, axis=0)
+            cover = sum(raw_masks[i].astype(np.uint8) for i in active)
+            for k, i in enumerate(active):
+                raw_masks[i] = raw_masks[i] & ((cover == 1) | (owner == k))
 
         masks = []
         for i in range(1, 5):
