@@ -39,6 +39,38 @@ class ColorIDMaskExtractor:
         if i == 3: return G - np.maximum(R, B)      # green
         return np.minimum(R, B) - G                 # magenta
 
+    SEAL_CLOSINGS = 7    # outline gaps up to ~100px are sealed before the silhouette is flood-filled
+    MIN_OPEN_EDGE = 30   # a hull piece outside the silhouette that touches the hull's outer edge this long is open background
+
+    def _silhouette(self, keep):
+        """Region enclosed by the actor's outline. Strokes leaving the frame are extended outward so the image border
+        doesn't leak; everything not connected to the largest open background area counts as inside."""
+        H, W = keep.shape; P = 80
+        pad = np.pad(keep.astype(np.uint8), ((P, P), (P, P)), mode="edge")
+        pad = cv2.morphologyEx(pad * 255, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8), iterations=self.SEAL_CLOSINGS,
+                               borderType=cv2.BORDER_CONSTANT, borderValue=0) > 0
+        pad[0, :] = pad[-1, :] = True; pad[:, 0] = pad[:, -1] = True
+        free = (~pad).astype(np.uint8)
+        _, lab = cv2.connectedComponents(free, connectivity=4)
+        dt = cv2.distanceTransform(free, cv2.DIST_L2, 3)
+        y, x = np.unravel_index(dt.argmax(), dt.shape)       # deepest open-background pixel
+        return (lab != lab[y, x])[P:P + H, P:P + W]
+
+    def _trim(self, hull, sil):
+        """Convex hull overfills concave poses (wedge between head and shoulder, etc.) and the generated wall there shows as a
+        halo. Drop hull pieces outside the silhouette that touch the hull's outer edge (= open background); keep enclosed pockets
+        (gaps in the line art) so the body stays solid."""
+        h8 = hull.astype(np.uint8)
+        edge = (h8 - cv2.erode(h8, np.ones((3, 3), np.uint8))) > 0
+        edge[:4, :] = edge[-4:, :] = False; edge[:, :4] = edge[:, -4:] = False   # image border is not 'open'
+        n, lab = cv2.connectedComponents((hull & ~sil).astype(np.uint8), connectivity=8)
+        out = hull.copy()
+        for k in range(1, n):
+            comp = lab == k
+            if (edge & (cv2.dilate(comp.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0)).sum() >= self.MIN_OPEN_EDGE:
+                out &= ~comp
+        return out if out.sum() >= 0.5 * hull.sum() else hull                  # safety: never collapse below half the hull
+
     def extract_masks(self, color_pose_reference, num_actors):
         img = (color_pose_reference[0].cpu().numpy() * 255).astype(np.uint8)
         close_kernel = np.ones((15, 15), np.uint8)
@@ -55,14 +87,15 @@ class ColorIDMaskExtractor:
                 cnt = np.bincount(lab2[keep], minlength=n2); cnt[0] = 0
                 keep &= lab2 == cnt.argmax()
             strokes[i - 1] = keep
-            # convex hull of the (lightly closed) strokes: can't have interior holes however fragmented the line art is
+            # convex hull of the (lightly closed) strokes can't have interior holes; _trim() then cuts away its open-background overfill
             closed = cv2.morphologyEx(keep.astype(np.uint8) * 255, cv2.MORPH_CLOSE, close_kernel, iterations=3,
                                       borderType=cv2.BORDER_CONSTANT, borderValue=0)  # default border value smeared masks to the image edge
             ys, xs = np.nonzero(closed)
             filled = np.zeros_like(closed)
             if len(xs) > 0:
                 cv2.fillConvexPoly(filled, cv2.convexHull(np.stack([xs, ys], axis=1).astype(np.int32)), 255)
-            raw_masks[i - 1] = filled > 0
+            hull = filled > 0
+            raw_masks[i - 1] = self._trim(hull, self._silhouette(keep)) if keep.any() else hull
 
         # Hulls of touching actors overlap: give each overlapping pixel to the actor whose OUTLINE is nearest.
         active = [i for i in range(4) if raw_masks[i] is not None]
